@@ -190,6 +190,21 @@ def parse_args():
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
+        "--debug_loss",
+        action="store_true",
+        help="debug loss for each image, if filenames are awailable in the dataset",
+    )
+    parser.add_argument(
+        "--shuffle_tags",
+        action="store_true",
+        help="Shuffle tags randomly, shuffling tags changes embeddings which might help with overfitting")
+    parser.add_argument(
+        "--p_drop_tags",
+        type=float,
+        default=0,
+        metavar="[0-1]",
+        help="Probability of droping a tag from caption, default=0")
+    parser.add_argument(
         "--cache_dir",
         type=str,
         default=None,
@@ -382,6 +397,9 @@ def parse_args():
     # Sanity checks
     if args.dataset_name is None and args.train_data_dir is None:
         raise ValueError("Need either a dataset name or a training folder.")
+
+    if args.p_drop_tags < 0 or 1 < args.p_drop_tags:
+        raise ValueError(f"p_drop_tags value {args.p_drop_tags} is not in range [0,1]")
 
     return args
 
@@ -632,7 +650,35 @@ def main():
     def preprocess_train(examples):
         images = [image.convert("RGB") for image in examples[image_column]]
         examples["pixel_values"] = [train_transforms(image) for image in images]
+
+        # shuffle and drop tags if needed
+        captions = []
+        condition = lambda x: True
+        if args.p_drop_tags != 0:
+            # condition when keep an element
+            condition = lambda x: args.p_drop_tags < random.random()
+        for caption in examples[caption_column]:
+            if 0 < args.p_drop_tags or args.shuffle_tags:
+                caps = caption.split(',')
+                if args.shuffle_tags:
+                    random.shuffle(caps)
+                caps_drop = list(filter(condition, caps))
+                if len(caps_drop) == 0:
+                    caps_drop.append(caps[0])
+                captions.append(','.join(caps_drop))
+            else:
+                captions.append(caption)
+        logger.debug('old caption %s', examples[caption_column])
+        examples[caption_column] = captions
+        logger.debug('new caption %s', examples[caption_column])
+
         examples["input_ids"] = tokenize_captions(examples)
+
+        if args.debug_loss:
+            fnames = [os.path.basename(image.filename) for image in examples[image_column] if image.filename]
+            if fnames:
+                examples["filenames"] = fnames
+
         return examples
 
     with accelerator.main_process_first():
@@ -797,6 +843,10 @@ def main():
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
                     loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
                     loss = loss.mean()
+
+                if args.debug_loss and "filenames" in batch:
+                    for fname in batch["filenames"]:
+                        accelerator.log({"loss_for_" + fname: loss}, step=global_step)
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
